@@ -257,27 +257,37 @@ void setupLoraMesher() {
     Serial.println("Lora initialized");
 }
 
+const uint32_t CAPTURE_LOCKOUT_MS = 1500;
+volatile bool pirRising = false;
+uint32_t lastCaptureMs = 0;
+
+void IRAM_ATTR pirISR() {
+  pirRising = true;                  // set a flag; do NOT capture inside ISR
+}
+
 void setup() {
     Serial.begin(115200);
     pinMode(BOARD_LED, OUTPUT); 
-    pinMode(MOTION_SENSOR_PIN, INPUT);
+    pinMode(MOTION_SENSOR_PIN, INPUT_PULLDOWN);  // if unsupported on this pin, use another GPIO or external pulldown
+    attachInterrupt(digitalPinToInterrupt(MOTION_SENSOR_PIN), pirISR, RISING);
     gpio_install_isr_service(0);
     //Screen.initDisplay();
     Serial.println("Board Init");     
     //setupLoraMesher();
     setUpCamera();
-    //printAddressDisplay();
+    //printAddressDisplay();    
     //createSendMessages();
 }
 
 void loop() {
-  int motionSensorState = digitalRead(MOTION_SENSOR_PIN);
-  if (motionSensorState == HIGH && !motionDetected) {
-    motionDetected = true;
-    Serial.println("Motion detected!");
-    captureImage();
-  } else if (motionSensorState == LOW) {
-    motionDetected = false;
+  if (pirRising) {
+    pirRising = false;
+    uint32_t now = millis();
+    if (now - lastCaptureMs > CAPTURE_LOCKOUT_MS) {
+      Serial.println("PIR rising edge -> capture");
+      captureImage();                // make sure captureImage() has NO long delays
+      lastCaptureMs = now;
+    }
   }
 }
 
