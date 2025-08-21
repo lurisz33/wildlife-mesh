@@ -72,6 +72,8 @@ void setUpCamera() {
   listDir(SD_MMC, "/camera", 0);
   if(cameraSetup()==1){
     ws2812SetColor(2);
+    delay(20);
+    ws2812SetColor(0);
   }
   else{
     ws2812SetColor(1);
@@ -109,7 +111,6 @@ void captureImage() {
       writejpg(SD_MMC, filePath.c_str(), fb->buf, fb->len);
       Serial.printf("Image saved to %s\n", filePath.c_str());
       ws2812SetColor(2);
-      delay(5000);
     }
     esp_camera_fb_return(fb);
   } else {
