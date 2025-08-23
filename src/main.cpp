@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include "ws2812.h"    
 #include "crc32.h" 
+#include "ft_protocol.h"
 
 #define OLED_SDA 3
 #define OLED_SCL 2
@@ -22,7 +23,7 @@
 #define MOTION_SENSOR_PIN 35
 
 #ifndef NODE_IS_GATEWAY
-#define NODE_IS_GATEWAY 1  
+#define NODE_IS_GATEWAY 0  
 #endif
 
 bool motionDetected = false;
@@ -109,57 +110,97 @@ void routeUIUpdateTask(void*){
 }
 
 void processReceivedPackets(void* parameter) {
-    for (;;) {
-        ulTaskNotifyTake(pdPASS, portMAX_DELAY);
-        if (radio.getReceivedQueueSize() > 0) {
-            pixelFlash(1, 100, 3);  
-            Serial.println("\n*** PACKETS IN QUEUE! ***");
-            Serial.printf("Queue size: %d\n", radio.getReceivedQueueSize());
+  for (;;) {
+    ulTaskNotifyTake(pdPASS, portMAX_DELAY);
 
-            while (radio.getReceivedQueueSize() > 0) {
-                Serial.println("Processing packet...");
-                AppPacket<dataPacket>* packet = radio.getNextAppPacket<dataPacket>();
+    if (radio.getReceivedQueueSize() > 0) {
+      pixelFlash(1, 100, 3);
+      Serial.println("\n*** PACKETS IN QUEUE! ***");
+      Serial.printf("Queue size: %d\n", radio.getReceivedQueueSize());
 
-                if (packet == NULL) {
-                    Serial.println("ERROR: Received NULL packet!");
-                    pixelFlash(2, 80, 1); 
-                    continue;
+      while (radio.getReceivedQueueSize() > 0) {
+        AppPacket<uint8_t>* pkt = radio.getNextAppPacket<uint8_t>();
+        if (!pkt) continue;
+
+        const uint8_t* p = (const uint8_t*)pkt->payload;
+        size_t n = pkt->payloadSize;
+
+        if (n >= 1 && ft_is_msg(p[0])) {
+          switch (p[0]) {
+            case FT_META: {
+              Serial.printf("[RX] META from %X\n", pkt->src);
+            } break;
+
+            case FT_CHUNK: {
+              const size_t hdr = sizeof(FtChunk) - FT_CHUNK_DATA;
+              if (n >= hdr) {
+                const FtChunk* ch = (const FtChunk*)p;
+                const size_t need = hdr + ch->dataLen;
+                if (ch->dataLen <= FT_CHUNK_DATA && n >= need) {
+                  Serial.printf("[RX] CHUNK from %X off=%u len=%u\n",
+                                pkt->src, (unsigned)ch->offset, (unsigned)ch->dataLen);
+                } else {
+                  Serial.printf("[RX] CHUNK bad len: n=%u need=%u dataLen=%u\n",
+                                (unsigned)n, (unsigned)need, (unsigned)ch->dataLen);
                 }
+              } else {
+                Serial.printf("[RX] CHUNK (short) from %X\n", pkt->src);
+              }
+            } break;
 
-                uint32_t recvNum = packet->payload->counter;
-                Serial.printf("Packet received from %X\n", packet->src);
-                Serial.printf("  Counter: %d\n", recvNum);
-                Serial.printf("  Payload size: %d bytes\n", packet->payloadSize);
+            case FT_ACK: {
+              if (n >= sizeof(FtAck)) {
+                const FtAck* a = (const FtAck*)p;
+                Serial.printf("[RX] ACK next=%u nack=%u\n",
+                              (unsigned)a->nextOffset, (unsigned)a->nackOffset);
+              } else {
+                Serial.printf("[RX] ACK (short) from %X\n", pkt->src);
+              }
+            } break;
 
-                bool dataOk = true;
-                for (int i = 0; i < 10; i++) {
-                    if (packet->payload->data[i] != ((recvNum + i) & 0xFF)) {
-                        dataOk = false;
-                        break;
-                    }
-                }
-                Serial.printf("  Data pattern: %s\n", dataOk ? "OK" : "MISMATCH");
-                if (!dataOk) pixelFlash(2, 60, 1); else pixelFlash(1, 60, 2);
+            case FT_END: {
+              Serial.printf("[RX] END from %X\n", pkt->src);
+            } break;
 
-                Screen.changeLineTwo("Recv " + String(recvNum));
-                Screen.changeLineThree(String(packet->src, HEX) + "->" + String(recvNum));
-                printRoutingTableToDisplay();
+            case FT_END_ACK: {
+              if (n >= sizeof(FtEndAck)) {
+                const FtEndAck* ea = (const FtEndAck*)p;
+                Serial.printf("[RX] END_ACK status=%u\n", (unsigned)ea->status);
+              } else {
+                Serial.printf("[RX] END_ACK (short)\n");
+              }
+            } break;
+          } 
 
-                pixelFlash(3, 100, 3);
+          Screen.changeLineTwo("FT msg");
+          Screen.changeLineThree(String(pkt->src, HEX));
+          printRoutingTableToDisplay();
 
-                radio.deletePacket(packet);
-            }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+          if (n >= sizeof(dataPacket)) {
+            const dataPacket* dp = (const dataPacket*)pkt->payload;
+            Serial.printf("[RX] legacy from %X, counter=%u, size=%d\n",
+                          pkt->src, (unsigned)dp->counter, (int)pkt->payloadSize);
+          } else {
+            Serial.printf("[RX] unknown %dB from %X\n", (int)n, pkt->src);
+          }
         }
 
-        static uint32_t lastPrint = 0;
-        if (++lastPrint >= 10) {
-            lastPrint = 0;
-            Serial.printf("Queue check - Size: %d\n", radio.getReceivedQueueSize());
-        }
+        radio.deletePacket(pkt);
+      }
+
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    static uint32_t lastPrint = 0;
+    if (++lastPrint >= 10) {
+      lastPrint = 0;
+      Serial.printf("Queue check - Size: %d\n", radio.getReceivedQueueSize());
+    }
+  }
 }
+
 
 TaskHandle_t receiveLoRaMessage_Handle = NULL;
 
@@ -332,5 +373,20 @@ void loop() {
       lastCaptureMs = now;
     }
   }
+  #if !NODE_IS_GATEWAY
+    static bool ft_test_sent = false;
+    if (!ft_test_sent && radio.routingTableSize() > 0) {
+    RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
+    if (gw) {
+        FtAck a;
+        a.type = FT_ACK;
+        a.nextOffset = 1234;
+        a.nackOffset = 0xFFFFFFFFu;
+        radio.sendReliable(gw->networkNode.address, &a, sizeof(a));
+        Serial.println("[CAM] sent dummy FT_ACK");
+        ft_test_sent = true;
+    }
+    }
+  #endif
   vTaskDelay(pdMS_TO_TICKS(5));
 }
