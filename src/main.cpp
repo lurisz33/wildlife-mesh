@@ -4,7 +4,8 @@
 #include <SPI.h>
 #include "camera.h" 
 #include <Wire.h>
-#include "ws2812.h"     
+#include "ws2812.h"    
+#include "crc32.h" 
 
 #define OLED_SDA 3
 #define OLED_SCL 2
@@ -58,7 +59,6 @@ void printRoutingTableToDisplay() {
     const int rtSize = radio.routingTableSize();
     Screen.changeSizeRouting(rtSize);
 
-    // render all routes
     char buf[24];
     for (int i = 0; i < rtSize; i++) {
         RouteNode* r = (*routingTableList)[i];
@@ -66,8 +66,6 @@ void printRoutingTableToDisplay() {
         snprintf(buf, sizeof(buf), "|%X(%d)->%X", n.address, n.metric, r->via);
         Screen.changeRoutingText(buf, i);
     }
-
-    // find GW and also remember the "best" route as a fallback
     RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
     RouteNode* best = nullptr;
     int bestMetric = 0x7FFFFFFF;
@@ -81,8 +79,6 @@ void printRoutingTableToDisplay() {
 
     routingTableList->releaseInUse();
     delete routingTableList;
-
-    // place the summary line in slot 0 or 1 depending on table size
     int sumSlot = (rtSize > 0) ? 1 : 0;
 
     if (gw) {
@@ -95,7 +91,6 @@ void printRoutingTableToDisplay() {
             Screen.changeRoutingText(gwBuf, sumSlot);
         }
     } else if (best) {
-        // fallback so the NODE shows something meaningful until GW role propagates
         char fb[24];
         snprintf(fb, sizeof(fb), "Best %X via %X", best->networkNode.address, best->via);
         Screen.changeRoutingText(fb, sumSlot);
@@ -109,7 +104,7 @@ void printRoutingTableToDisplay() {
 void routeUIUpdateTask(void*){
   for(;;){
     printRoutingTableToDisplay();
-    vTaskDelay(pdMS_TO_TICKS(1000));  // update every 1s
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
   }
 }
 
@@ -301,7 +296,7 @@ void setup() {
   Serial.println("\nBOOT: hello from ESP32-S3");
 
   ws2812Init();
-  ws2812SetColor(3);                  // blue = booting
+  ws2812SetColor(3);                 
 
   pinMode(MOTION_SENSOR_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(MOTION_SENSOR_PIN), pirISR, RISING);
@@ -314,27 +309,26 @@ void setup() {
 
   setUpCamera();
   if (!NODE_IS_GATEWAY) {
-    createSendMessages();   // enable periodic send on camera only
+    createSendMessages();  
   }
 
   printAddressDisplay();
   xTaskCreate(routeUIUpdateTask, "RouteUI", 2048, nullptr, 1, nullptr);
   Screen.drawDisplay(); 
 
-  ws2812SetColor(2);                  // green = ready
+  ws2812SetColor(2);            
   Serial.println("Setup complete.");
 }
 
 void loop() {
-  // PIR → capture throttle
   if (pirRising) {
     pirRising = false;
     uint32_t now = millis();
     if (now - lastCaptureMs > CAPTURE_LOCKOUT_MS) {
       Serial.println("PIR rising edge → capture");
-      ws2812SetColor(3);              // blue while capturing
-      captureImage();                 // keep this non-blocking as much as possible
-      ws2812SetColor(2);              // green when done
+      ws2812SetColor(3);              
+      captureImage();                
+      ws2812SetColor(2);            
       lastCaptureMs = now;
     }
   }
