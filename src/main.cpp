@@ -349,9 +349,6 @@ void setup() {
   Screen.drawDisplay();
 
   setUpCamera();
-  if (!NODE_IS_GATEWAY) {
-    createSendMessages();  
-  }
 
   printAddressDisplay();
   xTaskCreate(routeUIUpdateTask, "RouteUI", 2048, nullptr, 1, nullptr);
@@ -373,20 +370,5 @@ void loop() {
       lastCaptureMs = now;
     }
   }
-  #if !NODE_IS_GATEWAY
-    static bool ft_test_sent = false;
-    if (!ft_test_sent && radio.routingTableSize() > 0) {
-    RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
-    if (gw) {
-        FtAck a;
-        a.type = FT_ACK;
-        a.nextOffset = 1234;
-        a.nackOffset = 0xFFFFFFFFu;
-        radio.sendReliable(gw->networkNode.address, &a, sizeof(a));
-        Serial.println("[CAM] sent dummy FT_ACK");
-        ft_test_sent = true;
-    }
-    }
-  #endif
   vTaskDelay(pdMS_TO_TICKS(5));
 }
