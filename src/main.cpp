@@ -6,7 +6,11 @@
 #include <Wire.h>
 #include "ws2812.h"    
 #include "crc32.h" 
-#include "ft_protocol.h"
+#include "ft/ft_protocol.h"
+#include "ft/ft_common.h"
+#include "ft/ft_dispatch.h"
+#include "ft/ft_gateway.h"
+#include "ft/ft_camera.h"
 
 #define OLED_SDA 3
 #define OLED_SCL 2
@@ -22,9 +26,7 @@
 
 #define MOTION_SENSOR_PIN 35
 
-#ifndef NODE_IS_GATEWAY
-#define NODE_IS_GATEWAY 0  
-#endif
+#define ENABLE_LEGACY_SEND 0
 
 bool motionDetected = false;
 
@@ -113,91 +115,36 @@ void processReceivedPackets(void* parameter) {
   for (;;) {
     ulTaskNotifyTake(pdPASS, portMAX_DELAY);
 
-    if (radio.getReceivedQueueSize() > 0) {
-      pixelFlash(1, 100, 3);
-      Serial.println("\n*** PACKETS IN QUEUE! ***");
-      Serial.printf("Queue size: %d\n", radio.getReceivedQueueSize());
+    while (radio.getReceivedQueueSize() > 0) {
+      AppPacket<uint8_t>* pkt = radio.getNextAppPacket<uint8_t>();
+      if (!pkt) continue;
 
-      while (radio.getReceivedQueueSize() > 0) {
-        AppPacket<uint8_t>* pkt = radio.getNextAppPacket<uint8_t>();
-        if (!pkt) continue;
+      const uint8_t* p = (const uint8_t*)pkt->payload;
+      size_t n = pkt->payloadSize;
 
-        const uint8_t* p = (const uint8_t*)pkt->payload;
-        size_t n = pkt->payloadSize;
-
-        if (n >= 1 && ft_is_msg(p[0])) {
-          switch (p[0]) {
-            case FT_META: {
-              Serial.printf("[RX] META from %X\n", pkt->src);
-            } break;
-
-            case FT_CHUNK: {
-              const size_t hdr = sizeof(FtChunk) - FT_CHUNK_DATA;
-              if (n >= hdr) {
-                const FtChunk* ch = (const FtChunk*)p;
-                const size_t need = hdr + ch->dataLen;
-                if (ch->dataLen <= FT_CHUNK_DATA && n >= need) {
-                  Serial.printf("[RX] CHUNK from %X off=%u len=%u\n",
-                                pkt->src, (unsigned)ch->offset, (unsigned)ch->dataLen);
-                } else {
-                  Serial.printf("[RX] CHUNK bad len: n=%u need=%u dataLen=%u\n",
-                                (unsigned)n, (unsigned)need, (unsigned)ch->dataLen);
-                }
-              } else {
-                Serial.printf("[RX] CHUNK (short) from %X\n", pkt->src);
-              }
-            } break;
-
-            case FT_ACK: {
-              if (n >= sizeof(FtAck)) {
-                const FtAck* a = (const FtAck*)p;
-                Serial.printf("[RX] ACK next=%u nack=%u\n",
-                              (unsigned)a->nextOffset, (unsigned)a->nackOffset);
-              } else {
-                Serial.printf("[RX] ACK (short) from %X\n", pkt->src);
-              }
-            } break;
-
-            case FT_END: {
-              Serial.printf("[RX] END from %X\n", pkt->src);
-            } break;
-
-            case FT_END_ACK: {
-              if (n >= sizeof(FtEndAck)) {
-                const FtEndAck* ea = (const FtEndAck*)p;
-                Serial.printf("[RX] END_ACK status=%u\n", (unsigned)ea->status);
-              } else {
-                Serial.printf("[RX] END_ACK (short)\n");
-              }
-            } break;
-          } 
-
-          Screen.changeLineTwo("FT msg");
-          Screen.changeLineThree(String(pkt->src, HEX));
-          printRoutingTableToDisplay();
-
-        } else {
-          if (n >= sizeof(dataPacket)) {
-            const dataPacket* dp = (const dataPacket*)pkt->payload;
-            Serial.printf("[RX] legacy from %X, counter=%u, size=%d\n",
-                          pkt->src, (unsigned)dp->counter, (int)pkt->payloadSize);
-          } else {
-            Serial.printf("[RX] unknown %dB from %X\n", (int)n, pkt->src);
-          }
-        }
-
+      if (ft_handle_rx(pkt->src, p, n)) {
+        // (optional UI)
+        Screen.changeLineTwo("FT msg");
+        Screen.changeLineThree(String(pkt->src, HEX));
+        printRoutingTableToDisplay();
         radio.deletePacket(pkt);
+        continue;
       }
 
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      // ---- Optional: keep your legacy 200B demo payload for testing ----
+      if (n >= sizeof(dataPacket)) {
+        const dataPacket* dp = (const dataPacket*)p;
+        Serial.printf("[RX] legacy from %X, counter=%u, size=%d\n",
+                      pkt->src, (unsigned)dp->counter, (int)n);
+      } else {
+        Serial.printf("[RX] unknown %dB from %X\n", (int)n, pkt->src);
+      }
+      // -----------------------------------------------------------------
+
+      radio.deletePacket(pkt);
     }
 
-    static uint32_t lastPrint = 0;
-    if (++lastPrint >= 10) {
-      lastPrint = 0;
-      Serial.printf("Queue check - Size: %d\n", radio.getReceivedQueueSize());
-    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -224,6 +171,7 @@ void printAddressDisplay() {
     Screen.changeLineOne(String(addrStr));
 }
 
+#if ENABLE_LEGACY_SEND
 void sendLoRaMessage(void*) {
     int dataTablePosition = 0;
 
@@ -289,6 +237,7 @@ void createSendMessages() {
         pixelFlash(4, 100, 1);
     }
 }
+#endif
 
 void setupLoraMesher() {
     LoraMesher::LoraMesherConfig config = LoraMesher::LoraMesherConfig();
@@ -300,7 +249,7 @@ void setupLoraMesher() {
     config.module        = LoraMesher::LoraModules::SX1280_MOD;
     config.freq          = 2400.0;
     config.bw            = 203.125;
-    config.sf            = 10;
+    config.sf            = 7;
     config.cr            = 5;
     config.power         = 13;
     config.preambleLength = 32;
@@ -309,12 +258,12 @@ void setupLoraMesher() {
     radio.begin(config);
     createReceiveMessages();
     radio.setReceiveAppDataTaskHandle(receiveLoRaMessage_Handle);
-    if (NODE_IS_GATEWAY) {
-      radio.addGatewayRole();
-      Serial.println("Role: GATEWAY");
-    } else {
-      Serial.println("Role: CAMERA");
-    }
+    #if NODE_IS_GATEWAY
+        radio.addGatewayRole();
+        Serial.println("Role: GATEWAY");
+    #else
+        Serial.println("Role: CAMERA");
+    #endif
     radio.start();
     
     Serial.println("Lora initialized");
@@ -349,6 +298,12 @@ void setup() {
   Screen.drawDisplay();
 
   setUpCamera();
+  #if NODE_IS_GATEWAY
+    ft_gw_setup();
+  #endif
+  #if !NODE_IS_GATEWAY && ENABLE_LEGACY_SEND
+    createSendMessages();
+  #endif
 
   printAddressDisplay();
   xTaskCreate(routeUIUpdateTask, "RouteUI", 2048, nullptr, 1, nullptr);
@@ -370,5 +325,32 @@ void loop() {
       lastCaptureMs = now;
     }
   }
+  #if !NODE_IS_GATEWAY
+  static bool meta_kickoff_done = false;
+  static uint8_t gw_seen_stable = 0;
+
+  if (!meta_kickoff_done) {
+    RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
+    if (gw) {
+      if (++gw_seen_stable >= 3) {     // 3 consecutive passes ~ 15 ms each in your loop,
+        uint32_t fileId = 0, start = 0;
+        if (ft_cam_handshakeMeta("image_0.jpg", fileId, start)) {
+          Serial.printf("[CAM] start offset %u for id=%08X\n",
+                        (unsigned)start, (unsigned)fileId);
+        } else {
+          Serial.println("[CAM] META postponed/failed; will retry next loop");
+          // leave meta_kickoff_done = false to retry
+        }
+        // If you want only one attempt total, set meta_kickoff_done = true here.
+        // For auto-retry until success, keep it false (recommended while developing).
+      }
+    } else {
+      gw_seen_stable = 0;
+      static uint32_t t0 = 0;
+      if (millis() - t0 > 3000) { t0 = millis(); Serial.println("[CAM] waiting for GW route..."); }
+    }
+  }
+#endif
+
   vTaskDelay(pdMS_TO_TICKS(5));
 }
