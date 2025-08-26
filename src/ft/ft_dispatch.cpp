@@ -23,26 +23,20 @@ bool ft_handle_rx(uint16_t src, const uint8_t* p, size_t n) {
     }
 
     case FT_ACK: {
-#if !NODE_IS_GATEWAY
-      if (n >= sizeof(FtAck)) {
-        const FtAck* a = (const FtAck*)p;
-        ft_cam_onAck(a);  // drop into camera mailbox
-        // optional debug:
-        Serial.printf("[RX] ACK id=%08X next=%u nack=%u\n",
-                      (unsigned)a->fileId,
-                      (unsigned)a->nextOffset,
-                      (unsigned)a->nackOffset);
-      } else {
-        Serial.printf("[FT] ACK short from %X\n", src);
-      }
-#else
-      // GW ignores ACKs in this step
-#endif
-      return true; // handled by FT layer
-    }
+    if (n < sizeof(FtAck)) return false;
+    const FtAck* a = (const FtAck*)p;
+    
+    Serial.printf("[FT] Got ACK from %04X: id=%08X next=%u\n",
+                  src, a->fileId, a->nextOffset);
+    
+    #if !NODE_IS_GATEWAY
+        ft_cam_onAck(a); 
+    #endif
+    
+    return true;
+    } 
 
     default:
-      // other FT types come in later steps
       Serial.printf("[FT] type %u not handled in this step\n", p[0]);
       return true;
   }

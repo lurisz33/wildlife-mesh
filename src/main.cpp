@@ -112,39 +112,61 @@ void routeUIUpdateTask(void*){
 }
 
 void processReceivedPackets(void* parameter) {
+  uint32_t lastLog = 0;
+  uint32_t packetsReceived = 0;
+  
   for (;;) {
-    ulTaskNotifyTake(pdPASS, portMAX_DELAY);
-
+    if (millis() - lastLog > 10000) {
+      lastLog = millis();
+      #if NODE_IS_GATEWAY
+      Serial.printf("[GW-RX] Receive task alive, total packets: %lu, queue size: %d\n", 
+                    packetsReceived, radio.getReceivedQueueSize());
+      #else  
+      Serial.printf("[CAM-RX] Receive task alive, total packets: %lu, queue size: %d\n",
+                    packetsReceived, radio.getReceivedQueueSize());
+      #endif
+    }
     while (radio.getReceivedQueueSize() > 0) {
+      #if NODE_IS_GATEWAY
+      const char* prefix = "[GW-RX]";
+      #else
+      const char* prefix = "[CAM-RX]";
+      #endif
+      
+      Serial.printf("%s Processing queue, size: %d\n", 
+                    prefix, radio.getReceivedQueueSize());
+      
       AppPacket<uint8_t>* pkt = radio.getNextAppPacket<uint8_t>();
-      if (!pkt) continue;
-
+      if (!pkt) {
+        Serial.printf("%s getNextAppPacket returned NULL\n", prefix);
+        break; 
+      }
+      
+      packetsReceived++;
+      
       const uint8_t* p = (const uint8_t*)pkt->payload;
       size_t n = pkt->payloadSize;
-
+      
+      Serial.printf("%s Received packet #%lu: src=%04X, len=%d, type=%u\n", 
+                    prefix, packetsReceived, pkt->src, (int)n, n > 0 ? p[0] : 255);
+      
+      if (n > 0) {
+        Serial.printf("%s First bytes:", prefix);
+        for (int i = 0; i < min((int)n, 8); i++) {
+          Serial.printf(" %02X", p[i]);
+        }
+        Serial.println();
+      }
+      
       if (ft_handle_rx(pkt->src, p, n)) {
-        // (optional UI)
-        Screen.changeLineTwo("FT msg");
-        Screen.changeLineThree(String(pkt->src, HEX));
-        printRoutingTableToDisplay();
-        radio.deletePacket(pkt);
-        continue;
-      }
-
-      // ---- Optional: keep your legacy 200B demo payload for testing ----
-      if (n >= sizeof(dataPacket)) {
-        const dataPacket* dp = (const dataPacket*)p;
-        Serial.printf("[RX] legacy from %X, counter=%u, size=%d\n",
-                      pkt->src, (unsigned)dp->counter, (int)n);
+        Serial.printf("%s Packet handled by FT protocol\n", prefix);
       } else {
-        Serial.printf("[RX] unknown %dB from %X\n", (int)n, pkt->src);
+        Serial.printf("%s Unknown/legacy msg from %04X\n", prefix, pkt->src);
       }
-      // -----------------------------------------------------------------
-
+      
       radio.deletePacket(pkt);
     }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -325,24 +347,22 @@ void loop() {
       lastCaptureMs = now;
     }
   }
-  #if !NODE_IS_GATEWAY
+#if !NODE_IS_GATEWAY
   static bool meta_kickoff_done = false;
   static uint8_t gw_seen_stable = 0;
 
   if (!meta_kickoff_done) {
     RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
     if (gw) {
-      if (++gw_seen_stable >= 3) {     // 3 consecutive passes ~ 15 ms each in your loop,
+      if (++gw_seen_stable >= 3) {
         uint32_t fileId = 0, start = 0;
         if (ft_cam_handshakeMeta("image_0.jpg", fileId, start)) {
           Serial.printf("[CAM] start offset %u for id=%08X\n",
                         (unsigned)start, (unsigned)fileId);
+          meta_kickoff_done = true; 
         } else {
           Serial.println("[CAM] META postponed/failed; will retry next loop");
-          // leave meta_kickoff_done = false to retry
         }
-        // If you want only one attempt total, set meta_kickoff_done = true here.
-        // For auto-retry until success, keep it false (recommended while developing).
       }
     } else {
       gw_seen_stable = 0;

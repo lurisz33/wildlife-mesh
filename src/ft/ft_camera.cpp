@@ -34,6 +34,9 @@ void ft_cam_onAck(const FtAck* a) {
 }
 
 bool ft_cam_handshakeMeta(const char* relName, uint32_t& fileId, uint32_t& startOffset) {
+  static uint32_t lastFileId = 0;
+  static char lastFileName[FT_FILE_NAME_MAX] = {0};
+  
   RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
   if (!gw) { Serial.println("[CAM] no GW route"); return false; }
 
@@ -41,8 +44,15 @@ bool ft_cam_handshakeMeta(const char* relName, uint32_t& fileId, uint32_t& start
   if (!getFileInfo(relName, fsize, fcrc)) {
     Serial.println("[CAM] file not found on /camera"); return false;
   }
-
-  uint32_t fid = esp_random();
+  uint32_t fid;
+  if (strcmp(lastFileName, relName) == 0 && lastFileId != 0) {
+    fid = lastFileId; 
+  } else {
+    fid = esp_random();
+    lastFileId = fid;
+    strncpy(lastFileName, relName, FT_FILE_NAME_MAX - 1);
+  }
+  
   FtMeta m{};
   m.type     = FT_META;
   m.fileId   = fid;
@@ -63,6 +73,7 @@ bool ft_cam_handshakeMeta(const char* relName, uint32_t& fileId, uint32_t& start
         startOffset = s_ack_last.nextOffset;
         fileId = fid;
         Serial.printf("[CAM] META ACK: start=%u\n", (unsigned)startOffset);
+        lastFileId = 0;  
         return true;
       }
     }
