@@ -10,7 +10,7 @@ enum FtMsgType : uint8_t {
 };
 
 #define FT_FILE_NAME_MAX 40
-#define FT_CHUNK_DATA    180
+#define FT_CHUNK_DATA 30
 
 #pragma pack(push,1)
 

@@ -359,6 +359,7 @@ void loop() {
         if (ft_cam_handshakeMeta("image_0.jpg", fileId, start)) {
           Serial.printf("[CAM] start offset %u for id=%08X\n",
                         (unsigned)start, (unsigned)fileId);
+          ft_cam_sendFile("image_0.jpg", fileId, start); 
           meta_kickoff_done = true; 
         } else {
           Serial.println("[CAM] META postponed/failed; will retry next loop");
