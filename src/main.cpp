@@ -11,6 +11,9 @@
 #include "ft/ft_dispatch.h"
 #include "ft/ft_gateway.h"
 #include "ft/ft_camera.h"
+#include <SD_MMC.h>
+#include "sd_read_write.h"
+enum : uint8_t { MSG_PING = 0xA1, MSG_PONG = 0xA2, MSG_BIG = 0xA3 };
 
 #define OLED_SDA 3
 #define OLED_SCL 2
@@ -111,63 +114,63 @@ void routeUIUpdateTask(void*){
   }
 }
 
-void processReceivedPackets(void* parameter) {
-  uint32_t lastLog = 0;
-  uint32_t packetsReceived = 0;
-  
-  for (;;) {
-    if (millis() - lastLog > 10000) {
-      lastLog = millis();
-      #if NODE_IS_GATEWAY
-      Serial.printf("[GW-RX] Receive task alive, total packets: %lu, queue size: %d\n", 
-                    packetsReceived, radio.getReceivedQueueSize());
-      #else  
-      Serial.printf("[CAM-RX] Receive task alive, total packets: %lu, queue size: %d\n",
-                    packetsReceived, radio.getReceivedQueueSize());
-      #endif
+void printDataPacket(AppPacket<dataPacket>* packet) {
+    if (!packet) return;
+    Serial.printf("[DATA] Packet from %04X: counter=%u, size=%u\n",
+                  packet->src, 
+                  packet->payload[0].counter,
+                  packet->getPayloadLength());
+    // Print first few bytes of data
+    Serial.print("[DATA] First 16 bytes: ");
+    for (int i = 0; i < 16 && i < sizeof(packet->payload[0].data); i++) {
+        Serial.printf("%02X ", packet->payload[0].data[i]);
     }
-    while (radio.getReceivedQueueSize() > 0) {
-      #if NODE_IS_GATEWAY
-      const char* prefix = "[GW-RX]";
-      #else
-      const char* prefix = "[CAM-RX]";
-      #endif
-      
-      Serial.printf("%s Processing queue, size: %d\n", 
-                    prefix, radio.getReceivedQueueSize());
-      
-      AppPacket<uint8_t>* pkt = radio.getNextAppPacket<uint8_t>();
-      if (!pkt) {
-        Serial.printf("%s getNextAppPacket returned NULL\n", prefix);
-        break; 
-      }
-      
-      packetsReceived++;
-      
-      const uint8_t* p = (const uint8_t*)pkt->payload;
-      size_t n = pkt->payloadSize;
-      
-      Serial.printf("%s Received packet #%lu: src=%04X, len=%d, type=%u\n", 
-                    prefix, packetsReceived, pkt->src, (int)n, n > 0 ? p[0] : 255);
-      
-      if (n > 0) {
-        Serial.printf("%s First bytes:", prefix);
-        for (int i = 0; i < min((int)n, 8); i++) {
-          Serial.printf(" %02X", p[i]);
+    Serial.println();
+}
+
+void processReceivedPackets(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdPASS, portMAX_DELAY);
+        pixelFlash(1, 100, 3);  // Blue flash on receive
+        
+        while (radio.getReceivedQueueSize() > 0) {
+            auto* rawPacket = radio.getNextAppPacket<uint8_t>();
+            if (!rawPacket) continue;
+            
+            uint16_t src = rawPacket->src;
+            size_t dataLen = rawPacket->getPayloadLength();
+            uint8_t* data = rawPacket->payload;
+            
+            Serial.printf("[RX] Packet from %04X, len=%u, type=%02X\n", 
+                          src, (unsigned)dataLen, data[0]);
+            
+            // First try to handle with ft_handle_rx
+            bool handled = ft_handle_rx(src, data, dataLen);
+            
+            if (!handled) {
+                // Handle non-FT packets (like dataPacket)
+                if (dataLen == sizeof(dataPacket)) {
+                    // Convert to dataPacket
+                    radio.deletePacket(rawPacket);
+                    AppPacket<dataPacket>* dataPacketPtr = radio.getNextAppPacket<dataPacket>();
+                    if (dataPacketPtr) {
+                        uint32_t recvNum = dataPacketPtr->payload[0].counter;
+                        Serial.printf("[DATA] Received packet #%u from %04X\n", 
+                                      recvNum, dataPacketPtr->src);
+                        Screen.changeLineTwo("Data: " + String(recvNum));
+                        radio.deletePacket(dataPacketPtr);
+                    }
+                    continue;
+                } else {
+                    Serial.printf("[RX] Unhandled packet type %02X from %04X\n", 
+                                  data[0], src);
+                }
+            }
+            
+            printRoutingTableToDisplay();
+            radio.deletePacket(rawPacket);
         }
-        Serial.println();
-      }
-      
-      if (ft_handle_rx(pkt->src, p, n)) {
-        Serial.printf("%s Packet handled by FT protocol\n", prefix);
-      } else {
-        Serial.printf("%s Unknown/legacy msg from %04X\n", prefix, pkt->src);
-      }
-      
-      radio.deletePacket(pkt);
     }
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
 }
 
 
@@ -287,7 +290,7 @@ void setupLoraMesher() {
         Serial.println("Role: CAMERA");
     #endif
     radio.start();
-    
+    Serial.printf("Local addr=%04X\n", radio.getLocalAddress());
     Serial.println("Lora initialized");
 }
 
@@ -319,6 +322,7 @@ void setup() {
   Screen.initDisplay();
   Screen.drawDisplay();
 
+
   setUpCamera();
   #if NODE_IS_GATEWAY
     ft_gw_setup();
@@ -326,10 +330,14 @@ void setup() {
   #if !NODE_IS_GATEWAY && ENABLE_LEGACY_SEND
     createSendMessages();
   #endif
+  //sdmmcInit();
 
   printAddressDisplay();
   xTaskCreate(routeUIUpdateTask, "RouteUI", 2048, nullptr, 1, nullptr);
   Screen.drawDisplay(); 
+
+  Serial.printf("sizeof(FtMeta)=%u sizeof(FtAck)=%u\n",
+              (unsigned)sizeof(FtMeta), (unsigned)sizeof(FtAck));
 
   ws2812SetColor(2);            
   Serial.println("Setup complete.");
@@ -348,30 +356,46 @@ void loop() {
     }
   }
 #if !NODE_IS_GATEWAY
-  static bool meta_kickoff_done = false;
-  static uint8_t gw_seen_stable = 0;
-
-  if (!meta_kickoff_done) {
+  {
+    static bool fileSent = false;
+    static uint32_t lastSendAttempt = 0;
+    const uint32_t SEND_RETRY_INTERVAL = 10000; // 10 seconds between attempts
+    
+    // Get gateway node
     RouteNode* gw = radio.getBestNodeWithRole(ROLE_GATEWAY);
-    if (gw) {
-      if (++gw_seen_stable >= 3) {
-        uint32_t fileId = 0, start = 0;
-        if (ft_cam_handshakeMeta("image_0.jpg", fileId, start)) {
-          Serial.printf("[CAM] start offset %u for id=%08X\n",
-                        (unsigned)start, (unsigned)fileId);
-          ft_cam_sendFile("image_0.jpg", fileId, start); 
-          meta_kickoff_done = true; 
+    if (gw && !fileSent) {
+      uint32_t now = millis();
+      if (now - lastSendAttempt > SEND_RETRY_INTERVAL) {
+        uint16_t gwAddr = gw->networkNode.address;
+        const char* fname = "image_0.jpg";
+        uint32_t fileId = 0x3CA1C8D9;  // You might want to generate this dynamically
+        uint32_t startOffset = 0;
+        
+        Serial.printf("[CAM] Sending file %s to gateway %04X\n", fname, gwAddr);
+        
+        // Send the file directly
+        bool success = ft_cam_sendFile(fname, fileId, startOffset, gwAddr);
+        
+        if (success) {
+          Serial.println("[CAM] File sent successfully");
+          fileSent = true;  // Mark as sent to avoid resending
         } else {
-          Serial.println("[CAM] META postponed/failed; will retry next loop");
+          Serial.println("[CAM] File send failed, will retry in 10 seconds");
         }
+        
+        lastSendAttempt = now;
       }
-    } else {
-      gw_seen_stable = 0;
-      static uint32_t t0 = 0;
-      if (millis() - t0 > 3000) { t0 = millis(); Serial.println("[CAM] waiting for GW route..."); }
+    }
+    
+    if (!gw) {
+      // No gateway available yet
+      if (millis() % 10000 < 10) {  // Print every 10 seconds
+        Serial.println("[CAM] Waiting for gateway in routing table...");
+      }
     }
   }
 #endif
+
 
   vTaskDelay(pdMS_TO_TICKS(5));
 }
